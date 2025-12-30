@@ -43,9 +43,9 @@ SAMPLE_RATE = 16000  # 16kHz
 BYTES_PER_SAMPLE = 2  # PCM16 = 2 bytes per sample
 CHANNELS = 1  # Mono
 
-# Streaming config
-MIN_CHUNK_DURATION_MS = 500  # Minimum audio before first transcription
-CHUNK_DURATION_MS = 1000  # Process every N ms of audio
+# Streaming config - Ultra low latency defaults
+MIN_CHUNK_DURATION_MS = 200  # Minimum audio before first transcription (was 500)
+CHUNK_DURATION_MS = 300  # Process every N ms of audio (was 1000)
 MIN_CHUNK_SAMPLES = int(SAMPLE_RATE * MIN_CHUNK_DURATION_MS / 1000)
 CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_DURATION_MS / 1000)
 
@@ -53,8 +53,8 @@ CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_DURATION_MS / 1000)
 class StreamingConfig(BaseModel):
     """Configuration for streaming transcription."""
     sample_rate: int = 16000
-    chunk_duration_ms: int = 1000
-    min_chunk_duration_ms: int = 500
+    chunk_duration_ms: int = 300  # More frequent updates
+    min_chunk_duration_ms: int = 200  # Faster first response
     enable_vad: bool = False
     vad_threshold: float = 0.5
 
@@ -135,12 +135,16 @@ class StreamingTranscriber:
         if self.is_done:
             return self.unprocessed_samples > 0
 
+        # Calculate sample thresholds from config
+        min_samples = int(self.config.sample_rate * self.config.min_chunk_duration_ms / 1000)
+        chunk_samples = int(self.config.sample_rate * self.config.chunk_duration_ms / 1000)
+
         # First transcription: wait for minimum duration
         if self.processed_samples == 0:
-            return self.unprocessed_samples >= MIN_CHUNK_SAMPLES
+            return self.unprocessed_samples >= min_samples
 
-        # Subsequent: process every CHUNK_SAMPLES
-        return self.unprocessed_samples >= CHUNK_SAMPLES
+        # Subsequent: process every chunk_samples
+        return self.unprocessed_samples >= chunk_samples
 
     async def transcribe(self) -> TranscriptMessage | None:
         """Transcribe current buffer and return result."""
@@ -159,9 +163,14 @@ class StreamingTranscriber:
                     language=self.language,
                     task="transcribe",
                     vad_filter=self.config.enable_vad,
-                    without_timestamps=True,  # Faster
-                    beam_size=1,  # Faster for streaming
-                    best_of=1,
+                    without_timestamps=True,  # Faster - no timestamp calculation
+                    beam_size=1,  # Greedy decoding - fastest
+                    best_of=1,  # No sampling
+                    temperature=0.0,  # Deterministic - faster
+                    condition_on_previous_text=False,  # Don't condition - faster for streaming
+                    compression_ratio_threshold=2.4,  # Default
+                    no_speech_threshold=0.6,  # Default
+                    initial_prompt=None,  # No prompt overhead
                 )
 
                 # Collect all segment texts
@@ -208,19 +217,21 @@ async def stream_transcription(
     model: str,
     language: str | None = None,
     sample_rate: int = 16000,
-    chunk_duration_ms: int = 1000,
+    min_chunk_ms: int = 200,  # Minimum audio before first transcript
+    chunk_ms: int = 300,  # How often to produce transcripts
     enable_vad: bool = False,
 ) -> None:
     """
     WebSocket endpoint for streaming audio transcription.
 
-    Optimized for low TTFT (Time to First Transcript) with 16kHz PCM16 mono input.
+    Optimized for ULTRA LOW TTFT (Time to First Transcript) with 16kHz PCM16 mono input.
 
     Query Parameters:
         model: Whisper model to use (e.g., "Systran/faster-whisper-large-v3")
         language: Language code (e.g., "tr", "en") or None for auto-detect
         sample_rate: Input audio sample rate (default: 16000)
-        chunk_duration_ms: How often to produce transcripts (default: 1000ms)
+        min_chunk_ms: Minimum audio before first transcript (default: 200ms, min: 100ms)
+        chunk_ms: How often to produce transcripts after first (default: 300ms)
         enable_vad: Enable voice activity detection (default: False for lowest latency)
 
     Protocol:
@@ -228,6 +239,8 @@ async def stream_transcription(
         2. Server sends JSON transcript messages as audio is processed
         3. Client sends {"type": "audio.done"} when finished
         4. Server sends final transcript and closes connection
+
+    For lowest TTFT, use: min_chunk_ms=100&chunk_ms=200
     """
     # Get dependencies
     config = get_config()
@@ -239,10 +252,15 @@ async def stream_transcription(
     # Send ready message
     await ws.send_json(TranscriptMessage(type="ready", text="Connection established").model_dump())
 
+    # Enforce minimum values for safety
+    min_chunk_ms = max(100, min_chunk_ms)  # At least 100ms
+    chunk_ms = max(100, chunk_ms)  # At least 100ms
+
     # Create transcriber
     streaming_config = StreamingConfig(
         sample_rate=sample_rate,
-        chunk_duration_ms=chunk_duration_ms,
+        min_chunk_duration_ms=min_chunk_ms,
+        chunk_duration_ms=chunk_ms,
         enable_vad=enable_vad,
     )
     transcriber = StreamingTranscriber(
