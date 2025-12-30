@@ -194,14 +194,35 @@ class StreamingTranscriber:
         latency_ms = (time.perf_counter() - start_time) * 1000
         return text, latency_ms
 
-    async def transcribe(self) -> TranscriptMessage | None:
-        """Transcribe current buffer. Runs in thread pool for concurrency."""
+    async def transcribe(self, force_final: bool = False) -> TranscriptMessage | None:
+        """Transcribe current buffer. Runs in thread pool for concurrency.
+
+        Args:
+            force_final: If True, always return a final transcript even if no new audio.
+        """
         if self._buffer_pos == 0:
+            # No audio at all - return empty final if forced
+            if force_final:
+                return TranscriptMessage(
+                    type="transcript.final",
+                    text="",
+                    latency_ms=0.0,
+                    audio_duration_ms=0.0,
+                )
             return None
 
         # Get current audio data (copy to avoid race conditions)
         audio_data = self.audio_buffer.copy()
         audio_duration_ms = len(audio_data) / self.config.sample_rate * 1000
+
+        # If forcing final and no new audio, return last known text
+        if force_final and self.unprocessed_samples == 0:
+            return TranscriptMessage(
+                type="transcript.final",
+                text=self.previous_text,
+                latency_ms=0.0,
+                audio_duration_ms=audio_duration_ms,
+            )
 
         try:
             # Run transcription in thread pool for concurrent execution
@@ -213,12 +234,13 @@ class StreamingTranscriber:
             self.processed_samples = self._buffer_pos
 
             # Determine message type
+            is_final = self.is_done or force_final
             msg_type: Literal["transcript.partial", "transcript.final"] = (
-                "transcript.final" if self.is_done else "transcript.partial"
+                "transcript.final" if is_final else "transcript.partial"
             )
 
             # Only send if text changed or final
-            if text != self.previous_text or self.is_done:
+            if text != self.previous_text or is_final:
                 self.previous_text = text
                 return TranscriptMessage(
                     type=msg_type,
@@ -342,12 +364,11 @@ async def stream_transcription(
                 try:
                     data = json.loads(message["text"])
                     if data.get("type") == "audio.done":
-                        # Final transcription
+                        # Final transcription - always send transcript.final
                         transcriber.mark_done()
-                        if transcriber.should_transcribe():
-                            result = await transcriber.transcribe()
-                            if result:
-                                await ws.send_json(result.model_dump())
+                        result = await transcriber.transcribe(force_final=True)
+                        if result:
+                            await ws.send_json(result.model_dump())
                         break
                 except json.JSONDecodeError:
                     logger.warning(f"Invalid JSON message: {message['text']}")
