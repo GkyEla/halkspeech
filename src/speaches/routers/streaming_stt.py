@@ -146,38 +146,45 @@ class StreamingTranscriber:
         # Subsequent: process every chunk_samples
         return self.unprocessed_samples >= chunk_samples
 
+    def _sync_transcribe(self, wav_buffer: BytesIO) -> tuple[str, float]:
+        """Synchronous transcription - runs in thread pool for concurrency."""
+        start_time = time.perf_counter()
+
+        with self.whisper_model_manager.load_model(self.model) as whisper:
+            segments, info = whisper.transcribe(
+                wav_buffer,
+                language=self.language,
+                task="transcribe",
+                vad_filter=self.config.enable_vad,
+                without_timestamps=True,  # Faster - no timestamp calculation
+                beam_size=1,  # Greedy decoding - fastest
+                best_of=1,  # No sampling
+                temperature=0.0,  # Deterministic - faster
+                condition_on_previous_text=False,  # Don't condition - faster for streaming
+                compression_ratio_threshold=2.4,  # Default
+                no_speech_threshold=0.6,  # Default
+                initial_prompt=None,  # No prompt overhead
+            )
+            # Collect all segment texts
+            text = "".join(segment.text for segment in segments).strip()
+
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        return text, latency_ms
+
     async def transcribe(self) -> TranscriptMessage | None:
-        """Transcribe current buffer and return result."""
+        """Transcribe current buffer and return result. Runs in thread pool for concurrency."""
         if len(self.audio_buffer) == 0:
             return None
 
-        start_time = time.perf_counter()
-
         # Convert to WAV for transcription
         wav_buffer = float32_to_wav_bytes(self.audio_buffer, self.config.sample_rate)
+        audio_duration_ms = len(self.audio_buffer) / self.config.sample_rate * 1000
 
         try:
-            with self.whisper_model_manager.load_model(self.model) as whisper:
-                segments, info = whisper.transcribe(
-                    wav_buffer,
-                    language=self.language,
-                    task="transcribe",
-                    vad_filter=self.config.enable_vad,
-                    without_timestamps=True,  # Faster - no timestamp calculation
-                    beam_size=1,  # Greedy decoding - fastest
-                    best_of=1,  # No sampling
-                    temperature=0.0,  # Deterministic - faster
-                    condition_on_previous_text=False,  # Don't condition - faster for streaming
-                    compression_ratio_threshold=2.4,  # Default
-                    no_speech_threshold=0.6,  # Default
-                    initial_prompt=None,  # No prompt overhead
-                )
-
-                # Collect all segment texts
-                text = "".join(segment.text for segment in segments).strip()
-
-            latency_ms = (time.perf_counter() - start_time) * 1000
-            audio_duration_ms = len(self.audio_buffer) / self.config.sample_rate * 1000
+            # Run transcription in thread pool for concurrent execution
+            text, latency_ms = await asyncio.to_thread(
+                self._sync_transcribe, wav_buffer
+            )
 
             # Update state
             self.processed_samples = len(self.audio_buffer)
