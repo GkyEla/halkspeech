@@ -46,6 +46,9 @@ from speaches.routers.stt import (
 from speaches.routers.vad import (
     router as vad_router,
 )
+from speaches.routers.streaming_stt import (
+    router as streaming_stt_router,
+)
 from speaches.utils import APIProxyError
 
 # Configure multipart form parser to allow larger file uploads
@@ -119,8 +122,9 @@ def create_app() -> FastAPI:
     app.include_router(speech_router, dependencies=http_dependencies)
     app.include_router(vad_router, dependencies=http_dependencies)
 
-    # WebSocket router WITHOUT authentication (handles its own)
+    # WebSocket routers WITHOUT authentication (handles its own)
     app.include_router(realtime_ws_router)
+    app.include_router(streaming_stt_router)  # New streaming STT endpoint
 
     # HACK: move this elsewhere
     app.get("/v1/realtime", include_in_schema=False)(lambda: RedirectResponse(url="/v1/realtime/"))
